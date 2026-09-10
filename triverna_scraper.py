@@ -57,9 +57,12 @@ stala liczba nocy).
 import argparse
 import csv
 import json
+import random
 import re
 import sys
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from urllib.parse import urlparse
@@ -173,9 +176,65 @@ class ScrapeCancelled(Exception):
     """Podnoszone gdy uzytkownik przerwie dzialanie skryptu (np. z GUI)."""
 
 
-def graphql_request(session: requests.Session, query: str, variables: dict, retries: int = 3, backoff: float = 1.5) -> dict:
+class _RateLimiter:
+    """Wymusza minimalny odstep miedzy KOLEJNYMI wyslaniami zapytan HTTP,
+    wspoldzielony miedzy wszystkimi watkami roboczymi Przebiegu 1 (patrz
+    max_workers w scrape()/_scrape_single_offer) - dzieki temu podniesienie
+    max_workers zwieksza rownolegle "w locie" polaczenia (a wiec skraca
+    czas scrapowania), ale NIE pozwala pojedynczemu watkowi wyslac zapytania
+    czesciej niz raz na `delay` sekund wzgledem ostatniego wyslania - to
+    jest ta sama gwarancja co dawny time.sleep(delay), tylko wspolna dla
+    calej puli watkow zamiast osobna per watek.
+
+    UWAGA: wait() zwraca PRZED faktycznym wyslaniem zapytania (pauza jest
+    przed dispatchem, nie po odpowiedzi jak w starym kodzie) - to celowe,
+    zeby oczekiwanie na odpowiedz serwera (roundtrip) mogl w tym czasie
+    nakladac sie na dispatch innego watku. Efekt uboczny: nawet przy
+    max_workers=1 tempo wysylania jest odrobine wyzsze niz w starym
+    kodzie (znika "martwy" czas oczekiwania na odpowiedz z przerwy miedzy
+    zapytaniami) - to swiadomy kompromis, nie usterka; jesli to budzi
+    watpliwosci co do tolerancji API na wieksze obciazenie, testuj
+    stopniowo zaczynajac od maleg zakresu dat."""
+
+    def __init__(self, delay: float):
+        self._delay = delay
+        self._lock = threading.Lock()
+        self._next_allowed = 0.0
+
+    def wait(self) -> None:
+        if self._delay <= 0:
+            return
+        with self._lock:
+            now = time.monotonic()
+            if now < self._next_allowed:
+                time.sleep(self._next_allowed - now)
+                now = self._next_allowed
+            self._next_allowed = now + self._delay
+
+
+def _parse_retry_after(value: str | None) -> float | None:
+    """Parsuje naglowek Retry-After (tylko postac "liczba sekund" - format
+    HTTP-date pomijamy, bo triverna.pl go nie uzywa; nieznany format ->
+    None, wtedy graphql_request spada z powrotem na zwykly backoff)."""
+    if not value:
+        return None
+    try:
+        return max(0.0, float(value))
+    except ValueError:
+        return None
+
+
+def graphql_request(
+    session: requests.Session,
+    query: str,
+    variables: dict,
+    rate_limiter: _RateLimiter,
+    retries: int = 3,
+    backoff: float = 1.5,
+) -> dict:
     last_exc = None
     for attempt in range(1, retries + 1):
+        rate_limiter.wait()
         try:
             resp = session.post(
                 GRAPHQL_URL,
@@ -183,6 +242,20 @@ def graphql_request(session: requests.Session, query: str, variables: dict, retr
                 data=json.dumps({"query": query, "variables": variables}),
                 timeout=20,
             )
+            if resp.status_code == 429:
+                # Osobna sciezka dla "za duzo zapytan": honorujemy Retry-After
+                # gdy serwer go zwrocil, inaczej exponencjalny backoff+jitter -
+                # NIE ten sam, krotki liniowy backoff co dla zwyklego 5xx/timeoutu
+                # ponizej, bo to inny rodzaj bledu (przeciazenie/throttling, nie
+                # chwilowa usterka pojedynczego zapytania).
+                retry_after = _parse_retry_after(resp.headers.get("Retry-After"))
+                wait_s = retry_after if retry_after is not None else backoff * (2**attempt) + random.uniform(0, 0.5)
+                last_exc = requests.exceptions.HTTPError(
+                    f"429 Too Many Requests (proba {attempt}/{retries})", response=resp
+                )
+                if attempt < retries:
+                    time.sleep(wait_s)
+                continue
             resp.raise_for_status()
             return resp.json()
         except (requests.RequestException, json.JSONDecodeError) as exc:
@@ -216,8 +289,8 @@ def sanitize_filename_part(name: str) -> str:
     return name
 
 
-def fetch_offer(session: requests.Session, path: str) -> dict:
-    data = graphql_request(session, OFFER_QUERY, {"path": path})
+def fetch_offer(session: requests.Session, path: str, rate_limiter: _RateLimiter) -> dict:
+    data = graphql_request(session, OFFER_QUERY, {"path": path}, rate_limiter)
     if "error" in data:
         raise RuntimeError(f"Blad pobierania oferty dla {path}: {data['error']}")
     offer = data.get("data", {}).get("offer")
@@ -226,7 +299,9 @@ def fetch_offer(session: requests.Session, path: str) -> dict:
     return offer
 
 
-def discover_offer_graph(session: requests.Session, base_offer: dict, base_path: str, log=print) -> list:
+def discover_offer_graph(
+    session: requests.Session, base_offer: dict, base_path: str, rate_limiter: _RateLimiter, log=print
+) -> list:
     """Znajduje WSZYSTKIE aktywne oferty powiazane z ta startowa poprzez pole
     'moreOffers' (widoczne na stronie jako sekcja "Zobacz tez:") - np. ten
     sam hotel sprzedawany osobno w planie BB i HB, albo pod kilkoma roznymi
@@ -259,7 +334,7 @@ def discover_offer_graph(session: requests.Session, base_offer: dict, base_path:
         if not entry_path:
             continue
         try:
-            full_offer = fetch_offer(session, entry_path)
+            full_offer = fetch_offer(session, entry_path, rate_limiter)
         except Exception as exc:
             log(f"  [ostrzezenie] nie udalo sie pobrac powiazanej oferty {entry_path}: {exc}")
             continue
@@ -283,7 +358,9 @@ def month_range(start: date, end: date):
             y += 1
 
 
-def fetch_calendar_days(session: requests.Session, token: str, start: date, end: date, delay: float, log=print) -> dict:
+def fetch_calendar_days(
+    session: requests.Session, token: str, start: date, end: date, rate_limiter: _RateLimiter, log=print
+) -> dict:
     """Pobiera dane kalendarza (dostepnosc, MLOS, ilosc wolnych pokoi) dla zakresu dat."""
     days: dict[str, CalendarDay] = {}
     for year, month in month_range(start, end):
@@ -291,14 +368,13 @@ def fetch_calendar_days(session: requests.Session, token: str, start: date, end:
             session,
             CALENDAR_QUERY,
             {"token": token, "input": {"year": year, "month": month, "startDateInterval": 0}},
+            rate_limiter,
         )
         if "error" in data:
             log(f"  [ostrzezenie] kalendarz {year}-{month:02d}: {data['error']}")
-            time.sleep(delay)
             continue
         calendar = data.get("data", {}).get("calendar")
         if not calendar:
-            time.sleep(delay)
             continue
         for d in calendar["dates"]:
             days[d["date"]] = CalendarDay(
@@ -310,7 +386,6 @@ def fetch_calendar_days(session: requests.Session, token: str, start: date, end:
                 quantity=d["quantity"],
                 lowest_calendar_price=d["discountedPrice"],
             )
-        time.sleep(delay)
     return days
 
 
@@ -330,6 +405,7 @@ def fetch_calculation(
     children: int,
     babies: int,
     rooms_booked: int,
+    rate_limiter: _RateLimiter,
 ) -> dict | None:
     """Wywoluje zapytanie 'calculation' dla danej daty przyjazdu i liczby nocy.
 
@@ -360,7 +436,7 @@ def fetch_calculation(
         },
     }
 
-    data = graphql_request(session, CALCULATION_QUERY, variables)
+    data = graphql_request(session, CALCULATION_QUERY, variables, rate_limiter)
 
     if "error" in data:
         return None
@@ -564,7 +640,7 @@ def _fetch_groups_data(
     room_occupancy: dict,
     babies: int,
     rooms_booked: int,
-    delay: float,
+    rate_limiter: _RateLimiter,
     log,
     day_str: str,
     quiet: bool = False,
@@ -578,7 +654,9 @@ def _fetch_groups_data(
     for group in groups_present:
         g_adults, g_kids = group
         try:
-            per_room = fetch_calculation(session, token, day, nights, g_adults, g_kids, babies, rooms_booked)
+            per_room = fetch_calculation(
+                session, token, day, nights, g_adults, g_kids, babies, rooms_booked, rate_limiter
+            )
         except RuntimeError as exc:
             # Pojedyncza data moze byc trwale zepsuta po stronie API
             # Triverny (np. brak danych cenowych daleko w przyszlosci dla
@@ -588,9 +666,7 @@ def _fetch_groups_data(
             # pobytu, zamiast przerywac cale skanowanie hotelu.
             if not quiet:
                 log(f"  {day_str} ({g_adults} dor.+{g_kids} dz.): blad zapytania API, pomijam te date - {exc}")
-            time.sleep(delay)
             continue
-        time.sleep(delay)
         if not per_room:
             continue
         # Zachowujemy tylko wpisy pokoi, ktorych WLASNE (naturalne)
@@ -606,6 +682,98 @@ def _fetch_groups_data(
     return groups_data
 
 
+def _fetch_day_data(
+    session: requests.Session,
+    token: str,
+    day: date,
+    idx: int,
+    total_days: int,
+    calendar_days: dict,
+    groups_present: set,
+    room_occupancy: dict,
+    babies: int,
+    rooms_booked: int,
+    fixed_nights: int | None,
+    rate_limiter: _RateLimiter,
+    check_cancel,
+) -> tuple[date, dict | None, list, bool]:
+    """Jednostka pracy Przebiegu 1 dla JEDNEJ daty przyjazdu - wydzielona z
+    _scrape_single_offer tak, zeby dalo sie ja uruchamiac rownolegle w puli
+    watkow (patrz ThreadPoolExecutor nizej). Celowo NIE pisze nigdzie do
+    dzielonego stanu (window_data/log/progress_callback) - caly wynik
+    (wpis do window_data + zebrane linie logu) zwraca do zlozenia przez
+    watek glowny, zeby te zapisy zawsze dzialy sie w jednym miejscu, bez
+    blokad i bez ryzyka rozjechanego/cofajacego sie paska postepu.
+
+    Nigdy nie podnosi wyjatku poza ScrapeCancelled (przerwanie przez
+    uzytkownika, musi przerwac CALE skanowanie - patrz _scrape_single_offer)
+    - kazdy inny blad jest lapany i zwracany jako (dzien pominiety,
+    had_error=True), zeby jeden zepsuty dzien nie ubijal calego zakresu."""
+    check_cancel()
+    day_str = day.strftime("%Y-%m-%d")
+    lines: list[str] = []
+    info = calendar_days.get(day_str)
+
+    if info is None:
+        lines.append(f"[{idx}/{total_days}] {day_str}: brak danych kalendarza, pomijam")
+        return day, None, lines, False
+    if not info.available or info.no_arrival:
+        lines.append(f"[{idx}/{total_days}] {day_str}: niedostepna jako data przyjazdu, pomijam")
+        return day, None, lines, False
+
+    nights = fixed_nights if fixed_nights else max(info.minimum_stay, 1)
+    checkout = day + timedelta(days=nights)
+    checkout_str = checkout.strftime("%Y-%m-%d")
+
+    lines.append(
+        f"[{idx}/{total_days}] Sprawdzam {day_str} -> {checkout_str} ({nights} noc/y, MLOS={info.minimum_stay})..."
+    )
+
+    def buffer_log(msg):
+        lines.append(str(msg))
+
+    try:
+        groups_data = _fetch_groups_data(
+            session, token, day, nights, groups_present, room_occupancy,
+            babies, rooms_booked, rate_limiter, buffer_log, day_str,
+        )
+
+        if not groups_data:
+            lines.append(f"  {day_str}: brak danych o cenie, pomijam")
+            return day, None, lines, False
+
+        # Dodatkowa "probka" o INNEJ liczbie nocy dla TEJ SAMEJ daty
+        # przyjazdu - patrz duzy komentarz w oryginalnej wersji tej petli
+        # (historia gita) / docstring _solve_overlapping_windows: eliminuje
+        # niedookreslonosc pojedynczej doby w ukladzie rownan Przebiegu 2.
+        extra_nights = nights + 1
+        if info.maximum_stay and extra_nights > info.maximum_stay:
+            extra_nights = nights - 1 if nights > 1 else 0
+        extra_groups_data = None
+        if extra_nights:
+            extra_groups_data = _fetch_groups_data(
+                session, token, day, extra_nights, groups_present, room_occupancy,
+                babies, rooms_booked, rate_limiter, buffer_log, day_str, quiet=True,
+            )
+            if not extra_groups_data:
+                extra_groups_data = None
+
+        entry = {
+            "nights": nights,
+            "groups": groups_data,
+            "checkout_str": checkout_str,
+            "extra": {"nights": extra_nights, "groups": extra_groups_data} if extra_groups_data else None,
+        }
+        total_rooms_found = sum(len(g["per_room"]) for g in groups_data.values())
+        lines.append(f"  {day_str}: OK ({total_rooms_found} pokoi)")
+        return day, entry, lines, False
+    except ScrapeCancelled:
+        raise
+    except Exception as exc:
+        lines.append(f"  {day_str}: nieoczekiwany blad, pomijam ten dzien - {exc}")
+        return day, None, lines, True
+
+
 def _scrape_single_offer(
     session: requests.Session,
     offer: dict,
@@ -617,12 +785,13 @@ def _scrape_single_offer(
     babies: int,
     rooms_booked: int,
     fixed_nights: int | None,
-    delay: float,
+    rate_limiter: _RateLimiter,
     log,
     check_cancel,
     progress_callback=None,
     progress_offset: int = 0,
     progress_total: int | None = None,
+    max_workers: int = 1,
 ) -> tuple[list[dict], str, dict]:
     """Scrapuje JEDNA konkretna oferte (patrz scrape() nizej - dla hoteli z
     kilkoma powiazanymi ofertami/pakietami to jest wywolywane osobno dla
@@ -649,81 +818,58 @@ def _scrape_single_offer(
     check_cancel()
 
     log(f"Pobieranie kalendarza dostepnosci {start_date} .. {end_date}")
-    calendar_days = fetch_calendar_days(session, token, start_date, end_date, delay, log=log)
+    calendar_days = fetch_calendar_days(session, token, start_date, end_date, rate_limiter, log=log)
 
     # --- Przebieg 1: pobierz surowe dane (suma calego okna pobytu) dla kazdej daty, ---
-    # osobno per grupa oblozenia (patrz _room_occupancy_groups).
+    # osobno per grupa oblozenia (patrz _room_occupancy_groups). Rownolegle w
+    # puli watkow (patrz max_workers) - to praca siecowa (I/O), wiec GIL nie
+    # przeszkadza, a wspolny _RateLimiter (patrz wyzej) i tak ogranicza
+    # laczne tempo wysylanych zapytan. KAZDY dzien to osobne zadanie
+    # zwracajace swoj wynik (patrz _fetch_day_data) - zapis do window_data,
+    # log() i progress_callback() dzieja sie WYLACZNIE na watku glownym
+    # ponizej (nigdy w watku roboczym), zeby uniknac wyscigow oraz
+    # rozjezdzajacego/cofajacego sie paska postepu.
     window_data: dict[date, dict] = {}
-    total_days = (end_date - start_date).days + 1
-    for idx, day in enumerate(daterange(start_date, end_date), start=1):
-        check_cancel()
-        day_str = day.strftime("%Y-%m-%d")
-        info = calendar_days.get(day_str)
+    days = list(daterange(start_date, end_date))
+    total_days = len(days)
+    completed = 0
+    consecutive_errors = 0
+    MAX_CONSECUTIVE_ERRORS = 8  # zabezpieczenie przed cichym dokonczeniem scrapowania w trakcie blokady/awarii API
 
-        if progress_callback:
-            progress_callback(progress_offset + idx, progress_total or total_days, day_str)
-
-        if info is None:
-            log(f"[{idx}/{total_days}] {day_str}: brak danych kalendarza, pomijam")
-            continue
-        if not info.available or info.no_arrival:
-            log(f"[{idx}/{total_days}] {day_str}: niedostepna jako data przyjazdu, pomijam")
-            continue
-
-        nights = fixed_nights if fixed_nights else max(info.minimum_stay, 1)
-        checkout = day + timedelta(days=nights)
-        checkout_str = checkout.strftime("%Y-%m-%d")
-
-        log(f"[{idx}/{total_days}] Sprawdzam {day_str} -> {checkout_str} ({nights} noc/y, MLOS={info.minimum_stay})...")
-
-        groups_data = _fetch_groups_data(
-            session, token, day, nights, groups_present, room_occupancy,
-            babies, rooms_booked, delay, log, day_str,
-        )
-
-        if not groups_data:
-            log(f"  {day_str}: brak danych o cenie, pomijam")
-            continue
-
-        # Dodatkowa "probka" o INNEJ liczbie nocy dla TEJ SAMEJ daty
-        # przyjazdu - gdy dlugosc pobytu (MLOS) nie zmienia sie przez
-        # dluzszy odcinek dat, uklad rownan z samych okien o TEJ SAMEJ
-        # dlugosci ma dokladnie jedna niedookreslona stala (patrz
-        # _solve_overlapping_windows) - suma dla kazdego FAKTYCZNIE
-        # sprawdzonego okna wciaz wychodzi dokladnie, ale INNA (nie
-        # sprawdzona przez nas) dlugosc pobytu moze wtedy dac wynik
-        # przesuniety o kilka zlotych (sprawdzone na realnym przypadku:
-        # Five Seasons Szklarska Poreba, "Apartament Classic Plus w FS
-        # Two" - suma dwoch niezaleznie rozwiazanych 2-nocnych okien dala
-        # 1144.50 zl, podczas gdy swieze zapytanie o realny pobyt 1-4.09
-        # (3 noce) zwrocilo 1137 zl). Jedna dodatkowa probka o INNEJ
-        # dlugosci gdziekolwiek w takim odcinku CALKOWICIE eliminuje ta
-        # niedookreslonosc dla calego polaczonego odcinka (nie tylko
-        # lokalnie) - wiec sprawdzamy ja przy KAZDEJ dacie, nie tylko raz
-        # na jakis czas, zeby miec twarda gwarancje niezaleznie od tego,
-        # jak dlugo MLOS pozostaje bez zmian. Nie tworzy wlasnego wiersza
-        # w wyniku - sluzy wylacznie do dokladnego rozwiazania cen w
-        # Przebiegu 2 (patrz _iter_all_windows).
-        extra_nights = nights + 1
-        if info.maximum_stay and extra_nights > info.maximum_stay:
-            extra_nights = nights - 1 if nights > 1 else 0
-        extra_groups_data = None
-        if extra_nights:
-            extra_groups_data = _fetch_groups_data(
-                session, token, day, extra_nights, groups_present, room_occupancy,
-                babies, rooms_booked, delay, log, day_str, quiet=True,
-            )
-            if not extra_groups_data:
-                extra_groups_data = None
-
-        window_data[day] = {
-            "nights": nights,
-            "groups": groups_data,
-            "checkout_str": checkout_str,
-            "extra": {"nights": extra_nights, "groups": extra_groups_data} if extra_groups_data else None,
+    with ThreadPoolExecutor(max_workers=max(1, max_workers)) as executor:
+        futures = {
+            executor.submit(
+                _fetch_day_data, session, token, day, idx, total_days, calendar_days,
+                groups_present, room_occupancy, babies, rooms_booked, fixed_nights,
+                rate_limiter, check_cancel,
+            ): day
+            for idx, day in enumerate(days, start=1)
         }
-        total_rooms_found = sum(len(g["per_room"]) for g in groups_data.values())
-        log(f"  {day_str}: OK ({total_rooms_found} pokoi)")
+        try:
+            for future in as_completed(futures):
+                day = futures[future]
+                _, entry, log_lines, had_error = future.result()
+                for line in log_lines:
+                    log(line)
+                if entry is not None:
+                    window_data[day] = entry
+                completed += 1
+                if progress_callback:
+                    progress_callback(progress_offset + completed, progress_total or total_days, day.strftime("%Y-%m-%d"))
+                if had_error:
+                    consecutive_errors += 1
+                    if consecutive_errors >= MAX_CONSECUTIVE_ERRORS:
+                        executor.shutdown(wait=True, cancel_futures=True)
+                        raise RuntimeError(
+                            f"Przerwano: {consecutive_errors} kolejnych dni z rzedu zakonczylo sie "
+                            "nieoczekiwanym bledem zapytania - mozliwe blokowanie/limitowanie zapytan "
+                            "przez triverna.pl. Sprobuj ponownie z mniejsza liczba watkow roboczych."
+                        )
+                else:
+                    consecutive_errors = 0
+        except ScrapeCancelled:
+            executor.shutdown(wait=True, cancel_futures=True)
+            raise
 
     # --- Przebieg 2: dla kazdej grupy oblozenia i kazdego pokoju w niej, ---
     # DOKLADNIE rozwiaz (raz, dla calego zakresu dat naraz) cene bazowa i
@@ -800,6 +946,7 @@ def scrape(
     log=print,
     progress_callback=None,
     cancel_event=None,
+    max_workers: int = 1,
 ) -> tuple[list[dict], str, dict]:
     """Glowna funkcja scrapujaca. Zwraca (lista_wierszy, nazwa_hotelu, kalendarz_dni).
 
@@ -819,6 +966,12 @@ def scrape(
         gdy zwroci True, scrapowanie jest przerywane (podnoszony ScrapeCancelled).
     kalendarz_dni: slownik data_str -> CalendarDay (z PIERWSZEJ/glownej
         oferty), przydatny np. do wyliczenia MLOS oferty.
+    max_workers: liczba rownoleglych watkow do pobierania cen (Przebiegu 1)
+        na oferte. Domyslnie 1 (dokladnie jak w dawnej, sekwencyjnej
+        wersji - jedno zapytanie na raz). Wieksze wartosci przyspieszaja
+        scrapowanie, ale rownolegle otwarte polaczenia do triverna.pl to
+        inny ksztalt ruchu niz dotychczasowy pojedynczy strumien - testuj
+        stopniowo (male zakresy dat), zanim zwiekszysz to na stale.
     """
 
     def check_cancel():
@@ -826,13 +979,14 @@ def scrape(
             raise ScrapeCancelled("Przerwano przez uzytkownika")
 
     session = requests.Session()
+    rate_limiter = _RateLimiter(delay)
     path = hotel_path_from_url(url)
 
     log(f"Pobieranie danych oferty: {path}")
-    base_offer = fetch_offer(session, path)
+    base_offer = fetch_offer(session, path, rate_limiter)
     check_cancel()
 
-    offers = discover_offer_graph(session, base_offer, path, log=log)
+    offers = discover_offer_graph(session, base_offer, path, rate_limiter, log=log)
     if len(offers) > 1:
         opis = ", ".join(f"{o.get('mealCode') or '?'} ({p})" for p, o in offers)
         log(
@@ -858,10 +1012,11 @@ def scrape(
             log(f"--- Oferta {i + 1}/{len(offers)}: {offer.get('mealCode') or '?'} ({offer_path}) ---")
         rows, h_name, cal_days = _scrape_single_offer(
             session, offer, offer_path, start_date, end_date, adults, children, babies,
-            rooms_booked, fixed_nights, delay, log, check_cancel,
+            rooms_booked, fixed_nights, rate_limiter, log, check_cancel,
             progress_callback=progress_callback,
             progress_offset=i * total_days_per_offer,
             progress_total=progress_total,
+            max_workers=max_workers,
         )
         for row in rows:
             key = (row["room_id"], row["arrival_date"], row["meal_code"])
@@ -904,7 +1059,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--babies", type=int, default=0, help="Liczba niemowlat")
     parser.add_argument("--rooms", type=int, default=1, help="Liczba rezerwowanych pokoi (domyslnie 1)")
     parser.add_argument("--nights", type=int, default=None, help="Stala liczba nocy dla kazdej daty (domyslnie: MLOS z kalendarza danej daty)")
-    parser.add_argument("--delay", type=float, default=0.6, help="Opoznienie miedzy zapytaniami w sekundach (domyslnie 0.6)")
+    parser.add_argument("--delay", type=float, default=0.6, help="Minimalny odstep miedzy zapytaniami w sekundach (domyslnie 0.6)")
+    parser.add_argument(
+        "--max-workers", type=int, default=1,
+        help="Liczba rownoleglych watkow pobierania cen (domyslnie 1 = dawne, sekwencyjne dzialanie). "
+             "Wieksze wartosci przyspieszaja scrapowanie, ale zwiekszaja liczbe rownoleglych polaczen do "
+             "triverna.pl - testuj stopniowo na malym zakresie dat przed uzyciem na produkcji.",
+    )
     parser.add_argument("--output", default=None, help="Sciezka pliku wyjsciowego CSV (domyslnie: <nazwa_hotelu><data_dd-mm-rrrr>.csv)")
     return parser.parse_args()
 
@@ -932,6 +1093,7 @@ def main() -> None:
         rooms_booked=args.rooms,
         fixed_nights=args.nights,
         delay=args.delay,
+        max_workers=args.max_workers,
     )
 
     output_path = args.output or build_output_filename(hotel_name, date.today())

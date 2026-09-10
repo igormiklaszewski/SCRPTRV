@@ -110,6 +110,17 @@ with st.expander("Obłożenie (domyślnie 2 dorosłych)"):
     babies = c3.number_input("Niemowlęta", min_value=0, max_value=4, value=0)
     rooms_booked = c4.number_input("Liczba pokoi", min_value=1, max_value=5, value=1)
 
+with st.expander("Szybkość scrapowania (zaawansowane)"):
+    max_workers = st.slider(
+        "Równoległe wątki pobierania cen", min_value=1, max_value=8, value=1,
+        help=(
+            "1 = dotychczasowe, sekwencyjne działanie (bezpieczny wybór). Wyższe wartości "
+            "przyspieszają scrapowanie, ale zwiększają liczbę równoległych połączeń do "
+            "triverna.pl — podnoś stopniowo i sprawdzaj na małym zakresie dat, zanim użyjesz "
+            "większej wartości na produkcji."
+        ),
+    )
+
 report_choice = st.radio(
     "Co wygenerować?",
     ["Cennik Mandala", "Cennik Mandala + raport dostępności (Ava)"],
@@ -194,6 +205,7 @@ if submitted:
                 delay=0.15,
                 log=log,
                 progress_callback=progress_cb,
+                max_workers=int(max_workers),
             )
 
         progress_bar.progress(1.0, text="Scrapowanie zakończone.")
