@@ -6,7 +6,7 @@ Scraper cennika triverna.pl — wersja Streamlit (port z aplikacji desktopowej .
 
 ```bash
 pip install -r requirements.txt
-streamlit run app.py
+streamlit run streamlit_app.py
 ```
 
 ## Auto-pobieranie z Mandali
@@ -32,7 +32,7 @@ sekretu funkcja zacznie działać bez żadnych zmian w kodzie.
 
 ## Struktura
 
-- `app.py` — interfejs Streamlit
+- `streamlit_app.py` — interfejs Streamlit
 - `triverna_scraper.py` — scraper cen (publiczne GraphQL API triverna.pl)
 - `triverna_xlsx.py` — generowanie plików xlsx (Mandala/Ava)
 - `mandala_fetcher.py` — automatyzacja pobierania z wewnętrznego systemu Mandala
