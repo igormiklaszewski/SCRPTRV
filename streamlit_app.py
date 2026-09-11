@@ -212,6 +212,19 @@ if submitted:
 
         progress_bar.progress(1.0, text="Scrapowanie zakończone.")
 
+        # Dni pominiete z powodu NIEOCZEKIWANEGO bledu (nie zwyklego braku
+        # ceny) sa domyslnie widoczne tylko w logu (ktory jest schowany,
+        # dopoki ktos nie zaznaczy "Pokaz szczegoly techniczne") - taka
+        # cicha utrata czesci danych latwo przeoczyc, wiec pokazujemy to
+        # tez jako widoczne ostrzezenie.
+        unexpected_error_days = sum(1 for line in log_lines if "nieoczekiwany blad, pomijam ten dzien" in line)
+        if unexpected_error_days:
+            st.warning(
+                f"{unexpected_error_days} dat(y) pominięto z powodu nieoczekiwanego błędu zapytania "
+                "(nie zwykłego braku ceny) — wynik może być niepełny. Zaznacz \"Pokaż szczegóły "
+                "techniczne\" poniżej, żeby zobaczyć których dat to dotyczy."
+            )
+
         if not rows:
             st.warning(
                 "Brak jakichkolwiek dostępnych dat przyjazdu w wybranym zakresie — "
