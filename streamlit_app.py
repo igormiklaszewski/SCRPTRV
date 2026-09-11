@@ -112,12 +112,14 @@ with st.expander("Obłożenie (domyślnie 2 dorosłych)"):
 
 with st.expander("Szybkość scrapowania (zaawansowane)"):
     max_workers = st.slider(
-        "Równoległe wątki pobierania cen", min_value=1, max_value=8, value=1,
+        "Równoległe wątki pobierania cen", min_value=1, max_value=core.MAX_SAFE_WORKERS, value=1,
         help=(
-            "1 = dotychczasowe, sekwencyjne działanie (bezpieczny wybór). Wyższe wartości "
-            "przyspieszają scrapowanie, ale zwiększają liczbę równoległych połączeń do "
-            "triverna.pl — podnoś stopniowo i sprawdzaj na małym zakresie dat, zanim użyjesz "
-            "większej wartości na produkcji."
+            "1 = pojedynczy wątek, brak dodatkowych równoległych połączeń — ale UWAGA: tempo "
+            "wysyłania zapytań jest tu odrobinę wyższe niż w starej, w pełni sekwencyjnej wersji "
+            "narzędzia (nowy limiter pauzuje przed wysłaniem kolejnego zapytania, a nie po "
+            "otrzymaniu odpowiedzi), więc to NIE jest dokładnie dawne tempo. Wyższe wartości "
+            "dodatkowo zwiększają liczbę równoległych połączeń do triverna.pl — podnoś stopniowo "
+            "i sprawdzaj na małym zakresie dat, zanim użyjesz większej wartości na produkcji."
         ),
     )
 

@@ -78,6 +78,12 @@ except AttributeError:
 
 GRAPHQL_URL = "https://hub.triverna.pl/graphql/v1.0.0"
 
+# Gorny, "bezpieczny" sufit rownoleglych watkow pobierania cen (Przebiegu 1) -
+# ten sam limit obowiazuje w CLI (--max-workers) i w interfejsie Streamlit
+# (suwak), zeby jeden z tych dwoch wejsc nie pozwalal na wiecej rownoleglych
+# polaczen do triverna.pl niz drugi. Wieksze wartosci nie byly testowane.
+MAX_SAFE_WORKERS = 8
+
 HEADERS = {
     "Content-Type": "application/json",
     "User-Agent": "Mozilla/5.0 (compatible; TrivernaPriceScraper/1.0)",
@@ -212,14 +218,20 @@ class _RateLimiter:
             self._next_allowed = now + self._delay
 
 
+_MAX_RETRY_AFTER_SECONDS = 300.0  # sensowny sufit - dluzsza/nieskonczona wartosc i tak nie ma sensu czekac
+
+
 def _parse_retry_after(value: str | None) -> float | None:
     """Parsuje naglowek Retry-After (tylko postac "liczba sekund" - format
     HTTP-date pomijamy, bo triverna.pl go nie uzywa; nieznany format ->
-    None, wtedy graphql_request spada z powrotem na zwykly backoff)."""
+    None, wtedy graphql_request spada z powrotem na zwykly backoff).
+    Gorny sufit (patrz _MAX_RETRY_AFTER_SECONDS) chroni przed patologicznymi
+    wartosciami (np. "inf", ogromna liczba) - bez niego time.sleep() w
+    graphql_request podniosloby nieobsluzony OverflowError."""
     if not value:
         return None
     try:
-        return max(0.0, float(value))
+        return max(0.0, min(float(value), _MAX_RETRY_AFTER_SECONDS))
     except ValueError:
         return None
 
@@ -249,7 +261,11 @@ def graphql_request(
                 # ponizej, bo to inny rodzaj bledu (przeciazenie/throttling, nie
                 # chwilowa usterka pojedynczego zapytania).
                 retry_after = _parse_retry_after(resp.headers.get("Retry-After"))
-                wait_s = retry_after if retry_after is not None else backoff * (2**attempt) + random.uniform(0, 0.5)
+                # random.Random() nowa za kazdym razem (nie modulowy random.uniform) -
+                # ten kod dziala w wielu watkach na raz, a wspoldzielony globalny
+                # generator modulu random nie jest do tego przeznaczony (nie
+                # popsulby danych pod GIL-em, ale nie ma potrzeby dzielic stanu).
+                wait_s = retry_after if retry_after is not None else backoff * (2**attempt) + random.Random().uniform(0, 0.5)
                 last_exc = requests.exceptions.HTTPError(
                     f"429 Too Many Requests (proba {attempt}/{retries})", response=resp
                 )
@@ -644,13 +660,23 @@ def _fetch_groups_data(
     log,
     day_str: str,
     quiet: bool = False,
-) -> dict:
+) -> tuple[dict, bool]:
     """Pobiera surowe dane (suma calego okna) dla KAZDEJ grupy oblozenia,
     dla jednej konkretnej (data, liczba_nocy). Wydzielone z glownej petli
     Przebiegu 1, bo scrape() wywoluje to DWA razy na date - raz dla
     "glownego" okna (MLOS), raz dla dodatkowej probki o innej dlugosci
-    pobytu (patrz duzy komentarz w _scrape_single_offer)."""
+    pobytu (patrz duzy komentarz w _scrape_single_offer).
+
+    Zwraca (groups_data, any_request_failed) - any_request_failed odroznia
+    "API odpowiedzialo, ale bez ceny dla tej grupy" (normalne, per-grupa
+    pomijamy) od "zapytanie o te grupe faktycznie zawiodlo po wyczerpaniu
+    ponowien" (moze oznaczac powazniejszy problem - blokade/limitowanie po
+    stronie API) - to drugie zasila wylacznik bezpieczenstwa w
+    _fetch_day_data/_scrape_single_offer, zeby seria PRAWDZIWYCH bledow
+    zapytan (a nie zwykly brak danych cenowych) faktycznie przerywala
+    skanowanie zamiast przejsc bez sladu."""
     groups_data = {}
+    any_request_failed = False
     for group in groups_present:
         g_adults, g_kids = group
         try:
@@ -663,7 +689,11 @@ def _fetch_groups_data(
             # malo obleganego hotelu - sprawdzone na realnym przypadku:
             # Grand Hotel Tiffi zwracal blad 500 dla konkretnych dat ~1.5
             # miesiaca naprzod). Pomijamy TYLKO te date/grupe/dlugosc
-            # pobytu, zamiast przerywac cale skanowanie hotelu.
+            # pobytu, zamiast przerywac cale skanowanie hotelu - ale
+            # zglaszamy to wyzej (any_request_failed), zeby seria takich
+            # bledow mogla zatrzymac skanowanie, gdy to nie pojedynczy
+            # przypadek, tylko oznaka szerszego problemu z API.
+            any_request_failed = True
             if not quiet:
                 log(f"  {day_str} ({g_adults} dor.+{g_kids} dz.): blad zapytania API, pomijam te date - {exc}")
             continue
@@ -679,7 +709,7 @@ def _fetch_groups_data(
             "per_room": per_room,
             "min_total": min(e["total"] for e in per_room.values()),
         }
-    return groups_data
+    return groups_data, any_request_failed
 
 
 def _fetch_day_data(
@@ -733,14 +763,20 @@ def _fetch_day_data(
         lines.append(str(msg))
 
     try:
-        groups_data = _fetch_groups_data(
+        groups_data, request_failed = _fetch_groups_data(
             session, token, day, nights, groups_present, room_occupancy,
             babies, rooms_booked, rate_limiter, buffer_log, day_str,
         )
 
         if not groups_data:
             lines.append(f"  {day_str}: brak danych o cenie, pomijam")
-            return day, None, lines, False
+            # request_failed=True oznacza, ze KAZDA grupa dla tej daty
+            # skonczyla sie realnym bledem zapytania (nie zwyklym brakiem
+            # ceny) - liczy sie do wylacznika bezpieczenstwa w
+            # _scrape_single_offer; zwykly, "czysty" brak danych (API
+            # odpowiedzialo, po prostu nic nie ma) nadal NIE liczy sie jako
+            # blad.
+            return day, None, lines, request_failed
 
         # Dodatkowa "probka" o INNEJ liczbie nocy dla TEJ SAMEJ daty
         # przyjazdu - patrz duzy komentarz w oryginalnej wersji tej petli
@@ -751,7 +787,11 @@ def _fetch_day_data(
             extra_nights = nights - 1 if nights > 1 else 0
         extra_groups_data = None
         if extra_nights:
-            extra_groups_data = _fetch_groups_data(
+            # Blad w probce dodatkowej nie liczy sie do wylacznika
+            # bezpieczenstwa - to dane pomocnicze (patrz komentarz nizej),
+            # a glowne okno juz sie powiodlo (jestesmy za warunkiem "if not
+            # groups_data" powyzej), wiec ten dzien i tak jest sukcesem.
+            extra_groups_data, _extra_request_failed = _fetch_groups_data(
                 session, token, day, extra_nights, groups_present, room_occupancy,
                 babies, rooms_booked, rate_limiter, buffer_log, day_str, quiet=True,
             )
@@ -833,8 +873,16 @@ def _scrape_single_offer(
     days = list(daterange(start_date, end_date))
     total_days = len(days)
     completed = 0
+    max_day_seen: date | None = None
     consecutive_errors = 0
     MAX_CONSECUTIVE_ERRORS = 8  # zabezpieczenie przed cichym dokonczeniem scrapowania w trakcie blokady/awarii API
+    # Wylacznik liczy bledy w kolejnosci KALENDARZOWEJ (submission order), nie
+    # w kolejnosci ukonczenia zadan (as_completed) - przy max_workers > 1 te
+    # dwie kolejnosci sie roznia, a "N kolejnych dni z rzedu" ma sens tylko
+    # liczone wzgledem faktycznej sasiedztwa dat, inaczej wynik zalezalby od
+    # przypadkowego timingu watkow zamiast od rzeczywistych danych.
+    pending_had_error: dict[int, bool] = {}
+    next_seq = 1
 
     with ThreadPoolExecutor(max_workers=max(1, max_workers)) as executor:
         futures = {
@@ -842,31 +890,42 @@ def _scrape_single_offer(
                 _fetch_day_data, session, token, day, idx, total_days, calendar_days,
                 groups_present, room_occupancy, babies, rooms_booked, fixed_nights,
                 rate_limiter, check_cancel,
-            ): day
+            ): (idx, day)
             for idx, day in enumerate(days, start=1)
         }
         try:
             for future in as_completed(futures):
-                day = futures[future]
+                idx, day = futures[future]
                 _, entry, log_lines, had_error = future.result()
                 for line in log_lines:
                     log(line)
                 if entry is not None:
                     window_data[day] = entry
                 completed += 1
+                if max_day_seen is None or day > max_day_seen:
+                    max_day_seen = day
                 if progress_callback:
-                    progress_callback(progress_offset + completed, progress_total or total_days, day.strftime("%Y-%m-%d"))
-                if had_error:
-                    consecutive_errors += 1
-                    if consecutive_errors >= MAX_CONSECUTIVE_ERRORS:
-                        executor.shutdown(wait=True, cancel_futures=True)
-                        raise RuntimeError(
-                            f"Przerwano: {consecutive_errors} kolejnych dni z rzedu zakonczylo sie "
-                            "nieoczekiwanym bledem zapytania - mozliwe blokowanie/limitowanie zapytan "
-                            "przez triverna.pl. Sprobuj ponownie z mniejsza liczba watkow roboczych."
-                        )
-                else:
-                    consecutive_errors = 0
+                    # Wyswietlamy NAJDALSZA dotychczas ukonczona date (nie
+                    # date zadania, ktore akurat wlasnie skonczylo), zeby
+                    # tekst paska postepu szedl chronologicznie naprzod
+                    # nawet gdy zadania koncza sie w innej kolejnosci niz
+                    # zostaly zlecone.
+                    progress_callback(progress_offset + completed, progress_total or total_days, max_day_seen.strftime("%Y-%m-%d"))
+
+                pending_had_error[idx] = had_error
+                while next_seq in pending_had_error:
+                    if pending_had_error.pop(next_seq):
+                        consecutive_errors += 1
+                        if consecutive_errors >= MAX_CONSECUTIVE_ERRORS:
+                            executor.shutdown(wait=True, cancel_futures=True)
+                            raise RuntimeError(
+                                f"Przerwano: {consecutive_errors} kolejnych dni z rzedu zakonczylo sie "
+                                "nieoczekiwanym bledem zapytania - mozliwe blokowanie/limitowanie zapytan "
+                                "przez triverna.pl. Sprobuj ponownie z mniejsza liczba watkow roboczych."
+                            )
+                    else:
+                        consecutive_errors = 0
+                    next_seq += 1
         except ScrapeCancelled:
             executor.shutdown(wait=True, cancel_futures=True)
             raise
@@ -967,11 +1026,16 @@ def scrape(
     kalendarz_dni: slownik data_str -> CalendarDay (z PIERWSZEJ/glownej
         oferty), przydatny np. do wyliczenia MLOS oferty.
     max_workers: liczba rownoleglych watkow do pobierania cen (Przebiegu 1)
-        na oferte. Domyslnie 1 (dokladnie jak w dawnej, sekwencyjnej
-        wersji - jedno zapytanie na raz). Wieksze wartosci przyspieszaja
-        scrapowanie, ale rownolegle otwarte polaczenia do triverna.pl to
-        inny ksztalt ruchu niz dotychczasowy pojedynczy strumien - testuj
-        stopniowo (male zakresy dat), zanim zwiekszysz to na stale.
+        na oferte. Domyslnie 1 - jak dawniej, w danej chwili leci tylko
+        jedno zapytanie NA RAZ, ale tempo wysylania jest odrobine wyzsze
+        niz w starej, w pelni sekwencyjnej wersji nawet przy tej wartosci
+        (patrz UWAGA w docstringu _RateLimiter.wait() - pauza jest teraz
+        przed wyslaniem zapytania, nie po otrzymaniu odpowiedzi, wiec to
+        NIE jest dokladnie dawne tempo). Wieksze wartosci dodatkowo
+        przyspieszaja scrapowanie, ale rownolegle otwarte polaczenia do
+        triverna.pl to inny ksztalt ruchu niz dotychczasowy pojedynczy
+        strumien - testuj stopniowo (male zakresy dat), zanim zwiekszysz
+        to na stale.
     """
 
     def check_cancel():
@@ -979,6 +1043,14 @@ def scrape(
             raise ScrapeCancelled("Przerwano przez uzytkownika")
 
     session = requests.Session()
+    # Domyslna pula polaczen requests/urllib3 to 10 - przy max_workers > 10
+    # nadmiarowe polaczenia byłyby otwierane i zamykane na nowo zamiast
+    # ponownie uzywane (utrata przyspieszenia z watkow), wiec dopasowujemy
+    # rozmiar puli do max_workers.
+    _pool_size = max(max_workers, requests.adapters.DEFAULT_POOLSIZE)
+    _adapter = requests.adapters.HTTPAdapter(pool_connections=_pool_size, pool_maxsize=_pool_size)
+    session.mount("https://", _adapter)
+    session.mount("http://", _adapter)
     rate_limiter = _RateLimiter(delay)
     path = hotel_path_from_url(url)
 
@@ -1062,12 +1134,28 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--delay", type=float, default=0.6, help="Minimalny odstep miedzy zapytaniami w sekundach (domyslnie 0.6)")
     parser.add_argument(
         "--max-workers", type=int, default=1,
-        help="Liczba rownoleglych watkow pobierania cen (domyslnie 1 = dawne, sekwencyjne dzialanie). "
-             "Wieksze wartosci przyspieszaja scrapowanie, ale zwiekszaja liczbe rownoleglych polaczen do "
-             "triverna.pl - testuj stopniowo na malym zakresie dat przed uzyciem na produkcji.",
+        help=f"Liczba rownoleglych watkow pobierania cen (domyslnie 1 = jedno zapytanie na raz jak dawniej, ale "
+             "tempo wysylania jest odrobine wyzsze niz w starej, w pelni sekwencyjnej wersji nawet przy tej "
+             "wartosci - patrz _RateLimiter). Wieksze wartosci przyspieszaja scrapowanie, ale zwiekszaja liczbe "
+             "rownoleglych polaczen do triverna.pl - testuj stopniowo na malym zakresie dat przed uzyciem na "
+             f"produkcji (maksimum {MAX_SAFE_WORKERS}, tyle co w interfejsie Streamlit). UWAGA: przyspieszenie "
+             "jest ograniczone przez --delay (wspolny rate limiter i tak nie pusci zapytan czesciej niz raz na "
+             "--delay sekund, niezaleznie od liczby watkow) - przy domyslnym --delay 0.6 (dobranym konserwatywnie) "
+             "realny zysk z wiekszej liczby watkow bywa niewielki (zmierzone: ~10%% na 62-dniowym zakresie); "
+             "wyrazny zysk (>2x, zmierzone: ~2.2x) wymaga mniejszego --delay (np. 0.15, jak uzywa aplikacja "
+             "Streamlit) razem z wiekszym --max-workers.",
     )
     parser.add_argument("--output", default=None, help="Sciezka pliku wyjsciowego CSV (domyslnie: <nazwa_hotelu><data_dd-mm-rrrr>.csv)")
-    return parser.parse_args()
+    args = parser.parse_args()
+    if args.max_workers < 1:
+        parser.error("--max-workers musi byc >= 1")
+    if args.max_workers > MAX_SAFE_WORKERS:
+        parser.error(
+            f"--max-workers {args.max_workers} przekracza bezpieczny limit {MAX_SAFE_WORKERS} "
+            f"(taki sam jak w interfejsie Streamlit) - wieksze wartosci nie byly testowane wzgledem "
+            "tolerancji triverna.pl na rownolegle polaczenia."
+        )
+    return args
 
 
 def main() -> None:
